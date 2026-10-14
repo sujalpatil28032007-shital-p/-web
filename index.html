@@ -18,7 +18,7 @@
 <div id="message" class="notice hidden"></div>
 </div></main>
 <script>
-const API = 'https://eduschedule-zvkp.onrender.com'; let appData=null; const DAY_OPTIONS=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
+const API = 'https://eduschedule-yodh.onrender.com'; let appData=null; const DAY_OPTIONS=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
 const $=id=>document.getElementById(id); const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 async function api(path,options={}){const r=await fetch(API+path,{...options,headers:{'Content-Type':'application/json',...(options.headers||{})}});let j={};try{j=await r.json()}catch{}if(!r.ok)throw Error(j.error||'Request failed');return j}
 function msg(text,error=false){$('message').textContent=text;$('message').classList.remove('hidden','error');if(error)$('message').classList.add('error');window.scrollTo({top:0,behavior:'smooth'});setTimeout(()=>$('message').classList.add('hidden'),5000)}
