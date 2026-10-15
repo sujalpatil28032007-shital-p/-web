@@ -21,7 +21,7 @@ DEFAULT = {
         'breaks': [{'start': '13:00', 'end': '14:00', 'name': 'Lunch Break'}]
     },
     'teachers': [], 'subjects': [], 'classes': [], 'rooms': [],
-    'timetable': [], 'conflicts': []
+    'timetable': [], 'conflicts': [], 'manual': []
 }
 
 
@@ -41,7 +41,9 @@ def init_db():
 def load_db():
     with sqlite3.connect(DB_PATH) as con:
         row = con.execute('SELECT data FROM app_state WHERE id=1').fetchone()
-    return json.loads(row[0]) if row else json.loads(json.dumps(DEFAULT))
+    data = json.loads(row[0]) if row else json.loads(json.dumps(DEFAULT))
+    data.setdefault('manual', [])
+    return data
 
 
 def save_db(data):
@@ -52,6 +54,8 @@ def save_db(data):
         )
 
 
+# Runs under gunicorn too (the __main__ block below does not), so the
+# database table always exists even if eduschedule.db is missing or empty.
 init_db()
 
 
@@ -93,6 +97,131 @@ def slot_in_break(slot, breaks):
     )
 
 
+def find(items, item_id):
+    return next((x for x in items if x['id'] == item_id), None)
+
+
+def type_fits(room, lecture_type):
+    room_type = room.get('type', 'Theory')
+    return room_type == lecture_type or (lecture_type == 'Theory' and room_type == 'Both')
+
+
+def validate_ids(data, class_id, subject_id, room_id):
+    cls = find(data['classes'], class_id)
+    if not cls:
+        raise ValueError('Select a valid class.')
+    subject = find(data['subjects'], subject_id)
+    if not subject or subject_id not in cls.get('subjectIds', []):
+        raise ValueError('This subject is not assigned to the selected class.')
+    room = find(data['rooms'], room_id)
+    if not room:
+        raise ValueError('Select a valid room.')
+    lecture_type = subject.get('type', 'Theory')
+    if not type_fits(room, lecture_type):
+        raise ValueError(f"{room['name']} is not a {lecture_type} room.")
+    teacher = find(data['teachers'], subject.get('teacherId'))
+    if not teacher:
+        raise ValueError('This subject has no teacher assigned.')
+    return cls, subject, room, teacher
+
+
+def build_entry(data, class_id, subject_id, room_id, day, slot_idx):
+    """Build one timetable entry, or raise ValueError saying why it is not allowed."""
+    cls, subject, room, teacher = validate_ids(data, class_id, subject_id, room_id)
+    settings = data['settings']
+    slots = time_slots(settings)
+    days = settings.get('days', [])
+    if day not in days:
+        raise ValueError('Select a valid day.')
+    try:
+        slot_idx = int(slot_idx)
+    except (TypeError, ValueError):
+        raise ValueError('Select a valid time slot.')
+    if not 0 <= slot_idx < len(slots):
+        raise ValueError('Select a valid time slot.')
+    slot = slots[slot_idx]
+    if slot_in_break(slot, settings.get('breaks', [])):
+        raise ValueError('That time slot falls in a break.')
+    teacher_days = teacher.get('availableDays', days)
+    if teacher_days and day not in teacher_days:
+        raise ValueError(f"{teacher['name']} is not available on {day}.")
+    if slot['start'] in teacher.get('unavailableSlots', {}).get(day, []):
+        raise ValueError(f"{teacher['name']} is unavailable at {slot['start']} on {day}.")
+    return {
+        'id': str(uuid.uuid4()),
+        'dayIndex': days.index(day),
+        'day': day,
+        'slotIndex': slot_idx,
+        'start': slot['start'],
+        'end': slot['end'],
+        'subjectId': subject['id'],
+        'subjectName': subject['name'],
+        'teacherId': teacher['id'],
+        'teacherName': teacher['name'],
+        'classId': cls['id'],
+        'className': cls['name'],
+        'roomId': room['id'],
+        'roomName': room['name'],
+        'type': subject.get('type', 'Theory'),
+        'manual': True
+    }
+
+
+def find_clash(entry, placed):
+    """Return a message if entry clashes with an already placed lecture, else None."""
+    for l in placed:
+        if l['day'] != entry['day']:
+            continue
+        if l['start'] == entry['start']:
+            if l['teacherId'] == entry['teacherId']:
+                return f"{entry['teacherName']} already teaches {l['className']} at that time."
+            if l['classId'] == entry['classId']:
+                return f"{entry['className']} already has {l['subjectName']} at that time."
+            if l['roomId'] == entry['roomId']:
+                return f"{entry['roomName']} is already used by {l['className']} at that time."
+        if l['classId'] == entry['classId'] and l['subjectId'] == entry['subjectId']:
+            return f"{entry['className']} already has {entry['subjectName']} on {entry['day']}."
+    return None
+
+
+def rebuild_manual(data):
+    """Re-validate saved manual assignments against the current data.
+    Returns (valid_entries, [(saved_record, reason), ...])."""
+    slots = time_slots(data['settings'])
+    valid, failed = [], []
+    for m in data.get('manual', []):
+        idx = next((i for i, s in enumerate(slots) if s['start'] == m.get('start')), None)
+        try:
+            if idx is None:
+                raise ValueError('That time slot no longer exists in the college settings.')
+            entry = build_entry(data, m.get('classId'), m.get('subjectId'),
+                                m.get('roomId'), m.get('day'), idx)
+        except ValueError as exc:
+            failed.append((m, str(exc)))
+            continue
+        entry['id'] = m['id']
+        valid.append(entry)
+    return valid, failed
+
+
+def quota_left(data, current, class_id, subject_id):
+    subject = find(data['subjects'], subject_id)
+    limit = max(0, int(subject.get('weeklyCount', 1))) if subject else 0
+    used = sum(1 for m in current
+               if m['classId'] == class_id and m['subjectId'] == subject_id)
+    return limit - used
+
+
+def manual_conflict(m, reason):
+    return {
+        'classId': m.get('classId'), 'className': m.get('className', ''),
+        'subjectId': m.get('subjectId'), 'subjectName': m.get('subjectName', ''),
+        'teacherId': m.get('teacherId'), 'teacherName': m.get('teacherName', ''),
+        'type': m.get('type', 'Theory'), 'lectureNo': 'Manual',
+        'reason': f'Manual assignment skipped: {reason}'
+    }
+
+
 def run_scheduler(data):
     settings = data['settings']
     slots = time_slots(settings)
@@ -101,6 +230,20 @@ def run_scheduler(data):
     timetable = []
     conflicts = []
     requirements = []
+
+    placed_manual = {}
+    valid_manual, failed_manual = rebuild_manual(data)
+    for m, reason in failed_manual:
+        conflicts.append(manual_conflict(m, reason))
+    for entry in valid_manual:
+        clash = find_clash(entry, timetable)
+        if clash:
+            conflicts.append(manual_conflict(entry, clash))
+            continue
+        timetable.append(entry)
+        key = (entry['classId'], entry['subjectId'])
+        placed_manual[key] = placed_manual.get(key, 0) + 1
+
     for cls in data['classes']:
         for subject_id in cls.get('subjectIds', []):
             subject = next((s for s in data['subjects'] if s['id'] == subject_id), None)
@@ -109,7 +252,8 @@ def run_scheduler(data):
             count = max(0, int(subject.get('weeklyCount', 1)))
             teacher_id = subject.get('teacherId')
             teacher = next((t for t in data['teachers'] if t['id'] == teacher_id), None)
-            for lecture_no in range(1, count + 1):
+            already = placed_manual.get((cls['id'], subject['id']), 0)
+            for lecture_no in range(already + 1, count + 1):
                 requirements.append({
                     'classId': cls['id'],
                     'className': cls['name'],
@@ -135,6 +279,7 @@ def run_scheduler(data):
             teacher_days = teacher.get('availableDays', days)
             if teacher_days and day not in teacher_days:
                 continue
+
             if any(
                 l['dayIndex'] == day_idx
                 and l['classId'] == req['classId']
@@ -272,7 +417,7 @@ def sample():
             {'id': 'r2', 'name': 'Room 102', 'type': 'Theory'},
             {'id': 'r3', 'name': 'Lab 1', 'type': 'Practical'}
         ],
-        'timetable': [], 'conflicts': []
+        'timetable': [], 'conflicts': [], 'manual': []
     })
     save_db(data)
     return jsonify({'status': 'success', 'data': data})
@@ -341,6 +486,92 @@ def delete_item(resource, item_id):
         for sub in data['subjects']:
             if sub.get('teacherId') == item_id:
                 sub['teacherId'] = None
+    link = {'teachers': 'teacherId', 'subjects': 'subjectId',
+            'classes': 'classId', 'rooms': 'roomId'}[resource]
+    data['manual'] = [m for m in data['manual'] if m.get(link) != item_id]
+    data['timetable'] = []
+    data['conflicts'] = []
+    save_db(data)
+    return jsonify({'status': 'deleted'})
+
+
+@app.get('/api/slots')
+def get_slots():
+    data = load_db()
+    try:
+        slots = time_slots(data['settings'])
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    breaks = data['settings'].get('breaks', [])
+    return jsonify({
+        'days': data['settings'].get('days', []),
+        'slots': [{'index': i, **s, 'isBreak': slot_in_break(s, breaks)}
+                  for i, s in enumerate(slots)]
+    })
+
+
+@app.get('/api/manual')
+def list_manual():
+    return jsonify(load_db()['manual'])
+
+
+@app.get('/api/free-slots')
+def free_slots():
+    """Slots where this class/subject/room combination is allowed right now."""
+    data = load_db()
+    class_id = request.args.get('classId')
+    subject_id = request.args.get('subjectId')
+    room_id = request.args.get('roomId')
+    try:
+        validate_ids(data, class_id, subject_id, room_id)
+        slots = time_slots(data['settings'])
+        current, _ = rebuild_manual(data)
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    if quota_left(data, current, class_id, subject_id) <= 0:
+        return jsonify({'free': [], 'message': 'All weekly lectures of this subject are already assigned.'})
+    free = []
+    for day in data['settings'].get('days', []):
+        for idx, slot in enumerate(slots):
+            try:
+                entry = build_entry(data, class_id, subject_id, room_id, day, idx)
+            except ValueError:
+                continue
+            if find_clash(entry, current) is None:
+                free.append({'day': day, 'slotIndex': idx,
+                             'start': slot['start'], 'end': slot['end']})
+    return jsonify({'free': free})
+
+
+@app.post('/api/manual')
+def add_manual():
+    data = load_db()
+    body = request.get_json(silent=True) or {}
+    try:
+        entry = build_entry(data, body.get('classId'), body.get('subjectId'),
+                            body.get('roomId'), body.get('day'), body.get('slotIndex'))
+        current, _ = rebuild_manual(data)
+        if quota_left(data, current, entry['classId'], entry['subjectId']) <= 0:
+            raise ValueError('All weekly lectures of this subject are already assigned.')
+        clash = find_clash(entry, current)
+        if clash:
+            raise ValueError(clash)
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    data['manual'].append(entry)
+    data['timetable'] = []
+    data['conflicts'] = []
+    save_db(data)
+    return jsonify({'status': 'success', 'item': entry}), 201
+
+
+@app.delete('/api/manual/<manual_id>')
+def delete_manual(manual_id):
+    data = load_db()
+    before = len(data['manual'])
+    data['manual'] = [m for m in data['manual'] if m['id'] != manual_id]
+    if len(data['manual']) == before:
+        return jsonify({'error': 'Record not found.'}), 404
     data['timetable'] = []
     data['conflicts'] = []
     save_db(data)
@@ -364,5 +595,5 @@ def generate():
 
 
 if __name__ == '__main__':
- 
+
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
